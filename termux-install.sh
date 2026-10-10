@@ -212,7 +212,7 @@ ROTATE_SECONDS=7200
 cd "$XK_DIR" || exit 1
 
 if [ ! -s "$CONFIGS_FILE" ]; then
-    echo "ERROR: $CONFIGS_FILE is missing or empty. Run 'chk' first."
+    echo "ERROR: $CONFIGS_FILE is missing or empty. Run 'xkmod-c' first."
     exit 1
 fi
 
