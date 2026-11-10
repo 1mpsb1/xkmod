@@ -26,7 +26,7 @@ chmod +x xray-knife
 rm -f Xray-knife-android-arm64-v8a.zip
 
 # update.sh
-echo "[0/4] Writing scripts..."
+echo "[0/5] Writing scripts..."
 cat <<'EOF' > update.sh
 #!/data/data/com.termux/files/usr/bin/bash
 
@@ -118,7 +118,7 @@ log "Compare copy: $CONFIGS_OLD"
 EOF
 
 # check-configs.sh
-echo "[1/4] Writing scripts..."
+echo "[1/5] Writing scripts..."
 cat <<'EOF' > check-configs.sh
 #!/data/data/com.termux/files/usr/bin/bash
 
@@ -129,7 +129,7 @@ OUTPUT_FILE="$XK_DIR/valid_configs.txt"
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"; }
 
 if [ ! -f "$INPUT_FILE" ]; then
-    log "ERROR: $INPUT_FILE not found. Run 'uxk' first to fetch configs."
+    log "ERROR: $INPUT_FILE not found. Run 'xkmod-u' first to fetch configs."
     exit 1
 fi
 
@@ -168,7 +168,7 @@ log "Saved to: $OUTPUT_FILE"
 EOF
 
 # proxyw.sh
-echo "[2/4] Writing scripts..."
+echo "[2/5] Writing scripts..."
 cat <<'EOF' > proxyw.sh
 #!/data/data/com.termux/files/usr/bin/bash
 
@@ -194,7 +194,7 @@ exec $SHELL
 EOF
 
 # xray-start.sh
-echo "[3/4] Writing scripts..."
+echo "[3/5] Writing scripts..."
 cat <<'EOF' > xray-start.sh
 #!/data/data/com.termux/files/usr/bin/bash
 
@@ -221,8 +221,118 @@ fi
   --rotate "$ROTATE_SECONDS"
 EOF
 
-echo "[4/4] Writing scripts..."
-chmod +x update.sh check-configs.sh proxyw.sh xray-start.sh
+# urlsort.sh
+echo "[4/5] Writing scripts..."
+cat <<'URLSORT_EOF' > urlsort.sh
+#!/data/data/com.termux/files/usr/bin/bash
+# xkmod-us: проверка и очистка urls.txt от мёртвых ссылок (404/410)
+set -uo pipefail
+
+URLS="${1:-$HOME/.xray-knife/urls.txt}"
+CONCURRENCY=15
+MODE="safe"
+TOKEN="${GITHUB_TOKEN:-}"
+DRY_RUN=0
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -c|--concurrency) CONCURRENCY="$2"; shift 2 ;;
+        -t|--token)       TOKEN="$2";       shift 2 ;;
+        -m|--mode)        MODE="$2";        shift 2 ;;
+        --dry-run)        DRY_RUN=1;        shift ;;
+        -h|--help)
+            echo "Usage: xkmod-us [urls.txt] [-c N] [-m safe|strict|report] [-t TOKEN] [--dry-run]"
+            exit 0 ;;
+        -*) echo "Неизвестный флаг: $1" >&2; exit 1 ;;
+        *)  URLS="$1"; shift ;;
+    esac
+done
+
+case "$MODE" in
+    safe|strict|report) ;;
+    *) echo "MODE: safe | strict | report" >&2; exit 1 ;;
+esac
+
+[[ -f "$URLS" ]] || { echo "Файл не найден: $URLS" >&2; exit 1; }
+
+OUTDIR="$(dirname "$URLS")"
+TSV=$(mktemp); TMP=$(mktemp); CLEAN=$(mktemp)
+trap 'rm -f "$TSV" "$TMP" "$CLEAN"' EXIT
+
+grep -vE '^[[:space:]]*(#|$)' "$URLS" \
+  | sed 's/[[:space:]]*$//' \
+  | awk '!seen[$0]++' > "$CLEAN"
+
+TOTAL=$(wc -l < "$CLEAN" | tr -d ' ')
+if [[ "$TOTAL" -eq 0 ]]; then
+    echo "В $URLS нет ссылок — ничего не меняю."
+    exit 0
+fi
+
+echo "Проверяю $TOTAL уникальных ссылок (параллельно: $CONCURRENCY)…"
+
+export TOKEN
+xargs -d '\n' -P "$CONCURRENCY" -I {} bash -c '
+  url="$1"
+  auth=()
+  [[ -n "${TOKEN:-}" ]] && auth=(-H "Authorization: Bearer $TOKEN")
+  code=$(curl -sS -o /dev/null -w "%{http_code}" -I -L --max-time 30 --retry 2 --retry-delay 1 "${auth[@]}" "$url" 2>/dev/null) || code="ERR"
+  if [[ "$code" =~ ^(000|403|405|501|ERR)$ ]]; then
+    code=$(curl -sS -o /dev/null -w "%{http_code}" -L --max-time 30 --retry 2 --retry-delay 1 "${auth[@]}" "$url" 2>/dev/null) || code="ERR"
+  fi
+  printf "%s\t%s\n" "$code" "$url"
+' _ {} < "$CLEAN" > "$TSV"
+
+[[ -s "$TSV" ]] || { echo "Не удалось получить статусы — urls.txt не тронут." >&2; exit 1; }
+
+A=$(awk -F'\t' '$1==200' "$TSV" | wc -l | tr -d ' ')
+D=$(awk -F'\t' '$1==404||$1==410' "$TSV" | wc -l | tr -d ' ')
+O=$(awk -F'\t' '$1!="200"&&$1!="404"&&$1!="410"' "$TSV" | wc -l | tr -d ' ')
+
+DEAD_FILE="$OUTDIR/dead.txt"
+OTHER_FILE="$OUTDIR/other.txt"
+REPORT_FILE="$OUTDIR/report.csv"
+
+awk -F'\t' '$1==404||$1==410 {print $2}' "$TSV" > "$DEAD_FILE"
+awk -F'\t' '$1!="200"&&$1!="404"&&$1!="410" {print $2}' "$TSV" > "$OTHER_FILE"
+{
+    echo "status,verdict,url"
+    awk -F'\t' '{v=($1==200)?"alive":(($1==404||$1==410)?"dead":"other"); printf "%s,%s,%s\n",$1,v,$2}' "$TSV"
+} > "$REPORT_FILE"
+
+if [[ "$MODE" == "report" ]]; then
+    echo "MODE=report: $URLS не изменён."
+else
+    STRICT=0; [[ "$MODE" == "strict" ]] && STRICT=1
+    awk -F'\t' -v strict="$STRICT" '
+        NR==FNR { st[$2]=$1; next }
+        {
+            line=$0; key=line; sub(/[[:space:]]+$/,"",key)
+            if (key=="" || key ~ /^[[:space:]]*#/) { print line; next }
+            c = st[key]
+            if (strict=="1") { if (c==200) print line }
+            else { if (c!=404 && c!=410) print line }
+        }
+    ' "$TSV" "$URLS" > "$TMP"
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        echo "--- (dry-run) новый $URLS ---"; cat "$TMP"; echo "--- конец ---"
+    else
+        cp -p "$URLS" "$URLS.bak.$(date +%Y%m%d-%H%M%S)"
+        mv "$TMP" "$URLS"
+        echo "Обновлён: $URLS"
+    fi
+fi
+
+echo -e "\n=== Итого ==="
+printf "  Проверено      : %d\n" "$TOTAL"
+printf "  OK (200)       : %d\n" "$A"
+printf "  404/410        : %d  -> %s\n" "$D" "$DEAD_FILE"
+printf "  Прочие статусы : %d  -> %s\n" "$O" "$OTHER_FILE"
+printf "  CSV-отчёт      : %s\n" "$REPORT_FILE"
+URLSORT_EOF
+
+echo "[5/5] Writing scripts..."
+chmod +x update.sh check-configs.sh proxyw.sh xray-start.sh urlsort.sh
 
 # Data files
 touch configs_filtered.txt configs_filtered.old
@@ -581,7 +691,8 @@ ln -sf "$XK_DIR/update.sh"        "$BIN_DIR/xkmod-u"
 ln -sf "$XK_DIR/check-configs.sh" "$BIN_DIR/xkmod-c"
 ln -sf "$XK_DIR/xray-start.sh"    "$BIN_DIR/xkmod-s"
 ln -sf "$XK_DIR/proxyw.sh"        "$BIN_DIR/xkmod-pw"
-chmod +x "$XK_DIR/update.sh" "$XK_DIR/check-configs.sh" "$XK_DIR/xray-start.sh" "$XK_DIR/proxyw.sh"
+ln -sf "$XK_DIR/urlsort.sh"       "$BIN_DIR/xkmod-us"
+chmod +x "$XK_DIR/update.sh" "$XK_DIR/check-configs.sh" "$XK_DIR/xray-start.sh" "$XK_DIR/proxyw.sh" "$XK_DIR/urlsort.sh"
 
 # Ensure BIN_DIR is in PATH for non-Termux
 case ":$PATH:" in
@@ -590,3 +701,10 @@ case ":$PATH:" in
 esac
 
 echo "Install finished."
+echo ""
+echo "Доступные команды:"
+echo "  xkmod-u   — загрузить конфиги из urls.txt"
+echo "  xkmod-c   — проверить и отфильтровать конфиги"
+echo "  xkmod-s   — запустить SOCKS-прокси"
+echo "  xkmod-pw  — направить сессию через прокси"
+echo "  xkmod-us  — проверить и очистить urls.txt от мёртвых ссылок"
